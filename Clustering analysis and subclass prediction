@@ -1,0 +1,113 @@
+#NTP预测
+library(ConsensusClusterPlus)
+library(CMScaller)
+library(reshape2)
+library(tidyverse)
+library(biomaRt)
+library(stringr)
+library(survival)
+library(survminer)
+#TCGA 训练集验证
+setwd("E:/TCGA")
+sur<-read.table("Survival_SupplementalTable_S1_20171025_xena.txt",sep = "\t",row.names = 1,header = T);colnames(sur)[1]<-"sample"
+sur<-sur[sur$cancer.type.abbreviation=="GBM",]%>%.[!duplicated(.),];rownames(sur)<-sur$sample
+setwd("E:/TCGA/GBM-TCGA")
+raw_data <- read.table("TCGA-GBM-array.txt", sep="\t",
+                       header=T, check.names=F, row.names=1)
+
+# 排除正常样本
+raw_data <- raw_data[, which(str_detect(colnames(raw_data), "-01$"))]
+colnames(raw_data)<-substr(colnames(raw_data),1,12)
+## 提取蛋白编码基因
+load("gtf_v22.Rdata")
+gene <- intersect(rownames(raw_data), gene_info$SYMBOL)
+
+#读取分组结果
+setwd("E:/胶质瘤/差异分析/ConsensusCluster_tcga/")
+classifier_cc<-read.csv("ConsensusCluster.k=3.consensusClass.csv",header = F);colnames(classifier_cc)<-c("sample","group")
+setwd("E:/胶质瘤/差异分析")
+degs<-read.table("degs.txt",sep = "\t",row.names = 1,header = T)%>%rownames()
+load(file = "diff_result_cc.rdata")
+#根据生存预后确定分组
+names(diff)<-c("intermediate","bad","good")
+templates<-lapply(names(diff), function(i){
+  #i<-"bad"
+  gsym.fc <-diff[[i]]
+  gsym.fc.sorted <- gsym.fc[order(gsym.fc$logFC, decreasing = T),]
+  group<-data.frame(probe=rownames(gsym.fc.sorted)[1:50],class=i,row.names = rownames(gsym.fc.sorted)[1:50])
+  return(group)
+})
+templates<-do.call(rbind,templates)
+#templates<-templates[rownames(templates)%in%degs,]
+templates$class<-as.factor(templates$class)#提取特征signature
+#提取表达谱
+emat<- raw_data[gene,colnames(raw_data)%in%classifier_cc$sample]
+emat_adj<-ematAdjust(emat,normMethod = "quantile")
+set.seed(20210628)
+res <- ntp(emat_adj, templates, doPlot=TRUE, nPerm=1000)
+head(res)
+
+Result<-data.frame(sample=rownames(res),marker=res$prediction)
+metadata<-merge(Result,sur)
+metadata$OS.time<-metadata$OS.time/365;metadata$OS<-as.numeric(metadata$OS)
+#metadata$group<-as.factor(metadata$group)
+metadata$marker<-as.factor(metadata$marker)
+fit<-survfit(Surv(OS.time,OS)~marker,data=metadata)
+ggsurvplot(fit,
+           data=metadata,
+           size=1,
+           censor=F,
+           palette = c("#008ECB", "#D14039","#EA921D"),
+           pval = T,
+           font.legend=12,
+           risk.table = T,
+           risk.table.height=0.25,
+           conf.int = F,
+           conf.int.style="step",
+           surv.median.line="hv",
+           xlim=c(0,10),
+           break.time.by=2.5,
+           ncensor.plot=FALSE)
+
+#pfi疾病进展差异
+metadata$PFI<-as.numeric(metadata$PFI)
+#metadata$group<-as.factor(metadata$group)
+metadata$PFI.time<-metadata$PFI.time/365
+fit<-survfit(Surv(PFI.time,PFI)~marker,data=metadata)
+ggsurvplot(fit,
+           data=metadata,
+           size=1,
+           censor=F,
+           palette = c("#008ECB", "#D14039","#EA921D"),
+           pval = T,
+           font.legend=12,
+           risk.table = T,
+           risk.table.height=0.25,
+           conf.int = F,
+           conf.int.style="step",
+           surv.median.line="hv",
+           xlim=c(0,5),
+           break.time.by=1,
+           ncensor.plot=FALSE)
+
+
+# 提取用于聚类的基因的表达矩阵
+comgene <- intersect(gene, degs) #提取有表达数据的目标基因
+indata <- raw_data[comgene,colnames(raw_data)%in%classifier_cc$sample] #根据自己的数据灵活处理
+
+#基于ConsensusClusterPlus共识聚类
+setwd("E:/胶质瘤/NTP分组验证")
+maxK=3
+subtype <- ConsensusClusterPlus(d = as.matrix(indata),
+                                maxK = maxK, 
+                                pItem = 0.8, 
+                                pFeature = 1, 
+                                reps = 1000, 
+                                clusterAlg = "pam",
+                                innerLinkage = "ward.D",
+                                finalLinkage = "average", 
+                                distance = "euclidean", 
+                                seed = 123456,
+                                plot = "pdf", 
+                                writeTable = TRUE,
+                                title = "ConsensusCluster") 
