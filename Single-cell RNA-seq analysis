@@ -1,0 +1,206 @@
+rm(list=ls())
+setwd("E:/胶质瘤/单细胞/GSE84465_RAW/")
+options(stringsAsFactors = F)
+
+library(Seurat)
+library(ggplot2)
+library(clustree)
+library(cowplot)
+library(dplyr)
+samples=list.files('./')
+samples 
+
+sceList = lapply(samples,function(pro){ 
+  #pro=samples[3]
+  print(pro)
+  #print(list.files(folder))
+  sce=read.csv(pro, sep = " ",header=T)
+  return(sce)
+})
+rawdata<-do.call(cbind,sceList)
+setwd("../")
+save(rawdata,file = "rawdata.rdata")
+load("rawdata.rdata")
+
+# 建立seurat对象 ---------------------------------------------------------------
+data <- CreateSeuratObject(counts = rawdata)
+#缺少注释信息，遂未添加信息
+
+# 计算线粒体基因reads的比例
+data=PercentageFeatureSet(data, "^MT-", col.name = "percent_mito")
+#计算核糖体基因比例
+data=PercentageFeatureSet(data, "^RP[SL]", col.name = "percent_ribo")
+#计算红血细胞基因比例
+data=PercentageFeatureSet(data, "^HB[^(P)]", col.name = "percent_hb")
+#细胞已通过初筛，无需删除低质量细胞
+# Plot QC
+feats <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo")
+VlnPlot(data, 
+        features = feats, pt.size = 0.1, ncol = 3) + NoLegend()
+#save(data,file="data.Rdata")
+# 开始过滤基因 -----------------------------------------------------------------
+
+# 筛选至少在15个细胞中表达的基因
+selected_f <- rownames(data)[Matrix::rowSums(data) > 15]
+datafilt <- subset(data, features = selected_f)
+
+# Filter Mitocondrial
+datafilt <- datafilt[!grepl("^MT-", rownames(datafilt)), ]
+
+# Filter Ribossomal gene (optional if that is a problem on your data)
+datafilt <- datafilt[!grepl("^RPL", rownames(datafilt)), ]
+datafilt <- datafilt[!grepl("^RPS", rownames(datafilt)), ]
+
+# 只保留蛋白编码基因
+setwd("E:/胶质瘤/表达谱/")
+load("gtf_v22.Rdata")
+
+selected_g <- intersect(rownames(datafilt),gene_info$SYMBOL)
+datafilt <- subset(datafilt, features = selected_g)
+
+dim(data)
+dim(datafilt)
+
+# 标准化 1.0 三步法 ------------------------------------------------------------
+# 经过测试，scale.factor=10000是最合适的参数
+datafilt <- NormalizeData(datafilt, normalization.method = "LogNormalize",
+                          scale.factor = 10000)
+GetAssayData(datafilt, slot="counts", assay="RNA")[1:10,1:10]
+GetAssayData(datafilt, slot="data", assay="RNA")[1:10,1:10]
+
+# 寻找变异度高的基因
+datafilt <- FindVariableFeatures(datafilt, selection.method = "vst",
+                                 nfeatures = 2000)
+head(datafilt@assays[["RNA"]]@var.features)[1:5]
+
+# scale标准化，标准化后的数据存在scale.data中
+datafilt <- ScaleData(datafilt, 
+                      features = VariableFeatures(object = datafilt))
+dim(GetAssayData(datafilt,'scale.data'))
+
+
+# 数据降维 ---------------------------------------------------------------------
+datafilt <- RunPCA(datafilt, assay = 'RNA',
+                   slot = 'scale.data')
+ElbowPlot(datafilt)
+datafilt <-  RunUMAP(datafilt, reduction = "pca", dims = 1:50)
+embed_umap <- Embeddings(datafilt, 'umap')
+#write.csv(embed_umap,'cluster/embed_umap.csv')
+#plan(multiprocess, workers = 6)
+library(RColorBrewer)
+mycol <- c(brewer.pal(5,"Set1"), brewer.pal(8,"Set2"),
+           brewer.pal(11,"Set3"), brewer.pal(12,"Paired"),
+           brewer.pal(8,"Accent"), brewer.pal(11,"Spectral"),
+           brewer.pal(11,"BrBG"), brewer.pal(11,"PiYG"),
+           brewer.pal(11,"PuOr"),brewer.pal(11,"RdBu"))
+DimPlot(datafilt, pt.size =0.75, cols = mycol, 
+        label=T, repel=T, raster=FALSE, 
+        label.size=5, reduction = "umap")
+
+info_anno <- datafilt@meta.data
+# 识别批次效应 -----------------------------------------------------------------
+
+# 基于总reads数的指标(已标准化的数据)
+allexp <- colSums(2^(as.matrix(GetAssayData(datafilt, slot = "data")))) %>%
+  data.frame() 
+allexp <- data.frame(id = rownames(allexp), exp = allexp[,1])
+info_anno <- data.frame(id = rownames(info_anno), info_anno)
+allexp <- merge(allexp, info_anno, by = "id")
+barplot(allexp$exp)
+
+# 基于总reads数的指标 (未标准化的数据)
+allexp <- colSums(as.matrix(GetAssayData(datafilt, slot = "counts"))) %>%
+  data.frame() 
+allexp <- data.frame(id = rownames(allexp), exp = allexp[,1])
+info_anno <- data.frame(id = rownames(info_anno), info_anno)
+allexp <- merge(allexp, info_anno, by = "id")
+barplot(allexp$exp)
+
+# 基于方差的指标
+varexp <- 2^(as.matrix(GetAssayData(datafilt, slot = "data"))) %>%
+  apply(2, var) %>% data.frame()
+varexp <- data.frame(id = rownames(varexp), exp = varexp[,1])
+varexp <- merge(varexp, info_anno, by = "id")
+barplot(varexp$exp)
+
+# 开始分群 --------------------------------------------------------------------
+library(harmony)
+datafilt <- FindNeighbors(datafilt, dims = 1:50)
+datafilt <- FindClusters(datafilt, resolution = 0.4, n.iter = 10)
+head(datafilt@meta.data)
+
+DimPlot(datafilt, pt.size =0.75, cols = mycol, label=T, repel=T,
+        raster=FALSE, label.size=5,
+        group.by = "seurat_clusters")
+
+# 单基因的可视化
+select_genes <- c('PTPRC',"EGFR","MOG","AGXT2L1","DCN","GPR17","STMN2")
+VlnPlot(datafilt, features = select_genes,
+        assay = 'RNA', slot = 'data',
+        pt.size=0, group.by="seurat_clusters", ncol=2)
+FeaturePlot(datafilt, features = select_genes,
+            cols =c("#f3f3f1","#009bc7","#0070b2"),
+            reduction = "umap", label=T, ncol=2)
+
+
+#singleR分类
+library(SingleR)
+library(celldex)
+hpca.se=HumanPrimaryCellAtlasData() ##第一次载入会下载数据集，可能会慢一些，后面在用时就不用下载了
+Immune.se=DatabaseImmuneCellExpressionData()
+meta=datafilt@meta.data #pbmc的meta文件，包含了seurat的聚类结果
+data_for_SingleR <- GetAssayData(datafilt, slot="data", assay="RNA")##获取标准化矩阵
+
+clusters <- datafilt@meta.data$RNA_snn_res.0.4
+data.hesc <- SingleR(data_for_SingleR, ref = hpca.se, labels = hpca.se$label.main,
+                     method = "cluster", clusters = clusters,assay.type.test = "logcounts",
+                     assay.type.ref = "logcounts") # 使用HumanPrimaryCellAtlasData参考数据集
+table(data.hesc$labels)
+celltype = data.frame(ClusterID=rownames(data.hesc), celltype=data.hesc$labels, stringsAsFactors = F) 
+datafilt@meta.data$singleR=celltype[match(clusters,celltype$ClusterID),'celltype']
+
+DimPlot(datafilt, reduction = "umap", group.by = "singleR")
+
+genes_to_check <- list(
+  astrocytes = c("AQP4", "ADGRV1", "GPC5", "RYR3"),
+  endothelial = c("CLDN5", "ABCB1", "EBF1","PECAM1", "VWF") ,
+  GABA = c("GAD2","GRIK1"),
+  excitatory = c("CAMK2A", "CBLN2", "LDB2") ,
+  inhibitory = c("GAD1", "LHFPL3", "PCDH15") ,
+  microglia = c("C3", "LRMDA", "DOCK8","TMEM119", "P2RY12", "GPR34", "OLFML3", "SLC2A5", "SALL1", "ADORA3","CD74") ,
+  oligodendrocytes = c("MBP", "PLP1", "ST18"), 
+  OPC=c("TNR","IGSF21","NEU4","GPR17"),
+  Ependymal=c("CFAP126","FAM183B","TMEM212","PIFO","TEKT1","DNAH12"),
+  pericyte=c(  'DCN', 'LUM',  'GSN' ,'FGF7','MME', 'ACTA2','RGS5',"PDGFRB"),
+  Macrophages=c("CRIP1", "S100A8", "S100A9", "ANXA1"),
+  TAMs=c('CD14', 'CD163',	"ITGAM", 'C1QA',"HLA-DRA","CSF1R","FCGR1A"),
+  cancer=c("CD15","CDH5"),
+  Neutrophils=c("CST3", "LYZ", "FCGR3B", "CSF3R")
+)
+library(stringr) 
+p_markers <- DotPlot(datafilt,features = genes_to_check,assay='RNA') +
+  theme(axis.text.x=element_text(angle=45,hjust=1.2,vjust = 1.1,size = 8))
+p_markers
+
+# 需要自行看图，定细胞亚群：  
+celltype=data.frame(ClusterID=0:14,
+                    celltype='un')
+celltype[celltype$ClusterID %in% c( '0',"3","6"),2]='Microglia'  
+celltype[celltype$ClusterID %in% c( '1',"5","7","8" ),2]='Neoplastic cells'
+celltype[celltype$ClusterID %in% c( '2' ,"10"),2]='Myeloid cells'   
+celltype[celltype$ClusterID %in% c( '4'),2]='OPCs'   
+celltype[celltype$ClusterID %in% c( "14" ),2]='Neurons' 
+celltype[celltype$ClusterID %in% c( '9'),2]='Unidentified' 
+celltype[celltype$ClusterID %in% c( '11' ),2]='Oligodendrocytes' 
+celltype[celltype$ClusterID %in% c( '12' ),2]='Astrocytes' 
+celltype[celltype$ClusterID %in% c( '13' ),2]='Pericyte' 
+table(celltype)
+
+datafilt@meta.data$celltype = "NA"
+for(i in 1:nrow(celltype)){
+  datafilt@meta.data[which(datafilt@meta.data$RNA_snn_res.0.4 == celltype$ClusterID[i]),'celltype'] <- celltype$celltype[i]}
+table(datafilt@meta.data$celltype)
+
+DimPlot(datafilt, pt.size =0.75, cols = mycol, label=T, repel=T,
+        raster=FALSE, label.size=5,
+        group.by = "celltype")
