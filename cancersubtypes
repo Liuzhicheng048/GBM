@@ -1,1 +1,78 @@
-d 
+library(iClusterPlus)
+library(GenomicRanges)
+library(gplots)
+library(lattice)
+library(tidyr)
+library(CancerSubtypes)
+Sys.setenv(LANGUAGE = "en") 
+options(stringsAsFactors = FALSE) 
+setwd("E:/TCGA/GBM-TCGA")
+
+load("tumorCNV.rda")
+gbm.seg<-data.frame(sample=substr(data$Sample,1,12),data[2:6])
+gbm.mut<-read.table("gbm_mut_matrix.txt",sep = "\t",row.names = 1,header = T)
+
+load("gbm_ methylation_data_ChAMPfiltered.Rdata")
+gbm.met<-myLoad$beta
+
+gbm.cn <- CNregions(seg=gbm.seg, epsilon = 0, adaptive = FALSE,
+                    rmCNV=FALSE, 
+                    frac.overlap = 0.5, rmSmallseg = TRUE, nProbes = 5)
+save(gbm.cn,file = "gbm.cn.region.rdata")
+load("gbm.cn.region.rdata")
+
+raw_data <- read.table("TCGA-GBM-array.txt", sep="\t",
+                       header=T, check.names=F, row.names=1)
+
+raw_data <- raw_data[, which(str_detect(colnames(raw_data), "-01$"))]
+colnames(raw_data)<-substr(colnames(raw_data),1,12)
+
+load("gtf_v22.Rdata")
+gene <- intersect(rownames(raw_data), gene_info$SYMBOL)
+gbm.exp<- raw_data[gene,]
+
+sur<-read.table("Survival_SupplementalTable_S1_20171025_xena.txt",sep = "\t",row.names = 1,header = T)
+colnames(sur)[1]<-"sample"
+sur<-sur[sur$cancer.type.abbreviation=="GBM",]%>%.[!duplicated(.),]
+rownames(sur)<-sur$sample
+
+gene<-read.table("metaresult.txt",sep = "\t",header = T)
+driver<-unlist(gene$gene)%>%unique()
+
+sample<-intersect(intersect(intersect(colnames(gbm.exp),rownames(gbm.cn)),rownames(gbm.mut)),sur$sample)
+
+gbm.cn2<-gbm.cn[sample,]%>%t()
+gbm.exp2<-gbm.exp[sample]
+gbm.mut2<-gbm.mut[sample,]%>%t()
+
+gbm.cli<-sur[sample,c("OS","OS.time","PFI","PFI.time")]
+
+if((all(colnames(gbm.cn2)==colnames(gbm.exp2)) & all(colnames(gbm.exp2)==colnames(gbm.mut2))&
+    all(rownames(gbm.cli)==colnames(gbm.exp2)))) {
+  cat("Samples successfully matched!\n") }
+time <- as.numeric(gbm.cli$OS.time)
+status <- as.numeric(gbm.cli$OS) # 1: dead 0: alive
+
+mRNA <- as.matrix(gbm.exp2)
+cnv <- as.matrix(gbm.cn2)
+mut<-as.matrix(gbm.mut2)
+###data distribution
+data.checkDistribution(mRNA)
+# top1000 variable
+data1 <-  FSbyVar(mRNA, cut.type="topk",value=1000)
+
+data2 <- FSbyVar(cnv, cut.type="topk",value=1000)
+
+data3 <- mut[rownames(mut)%in%driver,]
+
+TCGA_target <- list(exp=data1,cn=data2,mut=data3) 
+
+result_SNFCC <- ExecuteSNF.CC(TCGA_target, clusterNum=5, K=20, alpha=0.5, t=20,
+                              maxK = 5, pItem = 0.8,reps=500, 
+                              title = "Molecular_Subtype_SNFCC", plot = "png", 
+                              finalLinkage ="average") 
+
+SNFCC_group <- result_SNFCC$group 
+SNFCC_distanceMatrix <- result_SNFCC$distanceMatrix
+p_value <- survAnalysis(mainTitle="Molecular_Subtype_SNFCC",time,status,SNFCC_group,
+                        SNFCC_distanceMatrix,similarity=TRUE)
